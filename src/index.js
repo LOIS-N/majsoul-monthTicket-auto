@@ -1,8 +1,20 @@
+require('dotenv').config();
+
 const { randomUUID } = require('node:crypto');
 const protobuf = require('protobufjs/light');
 const WebSocket = require('ws');
 
 const DEFAULT_BASE = 'https://game.mahjongsoul.com/';
+
+
+// If true, attempt to claim the daily revive coin once and buy as many green gifts as possible with available coin.
+// Use this only for Master rank or above accounts.
+const BUY_GREEN_GIFT = false;
+
+const GREEN_GIFT_PRICE_GOLD = 15000;
+const GREEN_GIFT_MAX_COUNT_PER_GOODS = 4;
+const REVIVE_COIN_GOLD_BONUS = 18000;
+const BUY_FROM_ZHP_LIMIT_REACHED_CODE = 2402;
 
 function normalizeBase(raw) {
   const value = (raw || '').trim();
@@ -90,15 +102,18 @@ function loadProtoTypes(liqiJson) {
 
 
 
-  return {
-    Wrapper: root.lookupType('Wrapper'),
-    ReqHeatBeat: root.lookupType('lq.ReqHeatBeat'),
-    ReqOauth2Auth: root.lookupType('lq.ReqOauth2Auth'),
-    ReqOauth2Login: root.lookupType('lq.ReqOauth2Login'),
-    ReqCommon: root.lookupType('lq.ReqCommon'),
-    ResOauth2Auth: root.lookupType('lq.ResOauth2Auth'),
-    ResOauth2Login: root.lookupType('lq.ResLogin'), // ResOauth2Login이 없으므로 ResLogin 사용
-    ResPayMonthTicket: root.lookupType('lq.ResPayMonthTicket'),
+    return {
+      Wrapper: root.lookupType('Wrapper'),
+      ReqHeatBeat: root.lookupType('lq.ReqHeatBeat'),
+      ReqOauth2Auth: root.lookupType('lq.ReqOauth2Auth'),
+      ReqOauth2Login: root.lookupType('lq.ReqOauth2Login'),
+      ReqBuyFromZHP: root.lookupType('lq.ReqBuyFromZHP'),
+      ReqCommon: root.lookupType('lq.ReqCommon'),
+      ResOauth2Auth: root.lookupType('lq.ResOauth2Auth'),
+      ResOauth2Login: root.lookupType('lq.ResLogin'),
+      ResCommon: root.lookupType('lq.ResCommon'),
+      ResShopInfo: root.lookupType('lq.ResShopInfo'),
+      ResPayMonthTicket: root.lookupType('lq.ResPayMonthTicket'),
     ResFetchMonthTicketInfo: root.lookupType('lq.ResMonthTicketInfo')
   };
 }
@@ -299,6 +314,27 @@ function decode(type, buffer) {
   return type.decode(buffer);
 }
 
+async function oauth2Login(channel, proto, accessToken, versionToForce) {
+  const oauth2LoginWrapper = await channel.sendRequest(
+    '.lq.Lobby.oauth2Login',
+    encode(proto.ReqOauth2Login, {
+      type: 7,
+      access_token: accessToken,
+      reconnect: false,
+      device: { is_browser: true },
+      random_key: randomUUID(),
+      client_version_string: `web-${versionToForce}`,
+      gen_access_token: false,
+      currency_platforms: [2]
+    })
+  );
+  const loginResponse = decode(proto.ResOauth2Login, oauth2LoginWrapper.data);
+  if (!loginResponse.account) {
+    throw new Error('oauth2Login failed: account not found.');
+  }
+  return loginResponse;
+}
+
 async function run() {
   const uid = process.env.UID;
   const token = process.env.TOKEN;
@@ -357,23 +393,9 @@ async function run() {
       throw new Error(`oauth2Auth failed: ${JSON.stringify(authResponse)}`);
     }
 
-    const oauth2LoginWrapper = await channel.sendRequest(
-      '.lq.Lobby.oauth2Login',
-      encode(proto.ReqOauth2Login, {
-        type: 7,
-        access_token: authResponse.access_token,
-        reconnect: false,
-        device: { is_browser: true },
-        random_key: randomUUID(),
-        client_version_string: `web-${versionToForce}`,
-        gen_access_token: false,
-        currency_platforms: [2]
-      })
-    );
-    const loginResponse = decode(proto.ResOauth2Login, oauth2LoginWrapper.data);
-    if (!loginResponse.account) {
-      throw new Error('oauth2Login failed: account not found.');
-    }
+    const loginResponse = await oauth2Login(channel, proto, authResponse.access_token, versionToForce);
+    const loginGold = Number(loginResponse.account.gold ?? 0);
+    console.log('oauth2Login.account.gold:', loginGold);
 
     const payWrapper = await channel.sendRequest(
       '.lq.Lobby.payMonthTicket',
@@ -388,6 +410,78 @@ async function run() {
     );
     const infoResponse = decode(proto.ResFetchMonthTicketInfo, infoWrapper.data);
     console.log('fetchMonthTicketInfo:', JSON.stringify(infoResponse));
+
+    if (BUY_GREEN_GIFT) {
+      const gainReviveCoinWrapper = await channel.sendRequest(
+        '.lq.Lobby.gainReviveCoin',
+        encode(proto.ReqCommon, {})
+      );
+      const gainReviveCoinResponse = decode(proto.ResCommon, gainReviveCoinWrapper.data);
+      const gainReviveCoinErrorCode = Number(gainReviveCoinResponse?.error?.code ?? 0);
+      if (gainReviveCoinErrorCode === 0) {
+        console.log('gainReviveCoin: success');
+      } else {
+        console.log('gainReviveCoin: skipped', JSON.stringify(gainReviveCoinResponse));
+      }
+      const latestGold = loginGold + (gainReviveCoinErrorCode === 0 ? REVIVE_COIN_GOLD_BONUS : 0);
+      console.log('estimatedGoldForPurchase:', latestGold);
+
+      const shopInfoWrapper = await channel.sendRequest(
+        '.lq.Lobby.fetchShopInfo',
+        encode(proto.ReqCommon, {})
+      );
+      const shopInfoResponse = decode(proto.ResShopInfo, shopInfoWrapper.data);
+      if (!shopInfoResponse.shop_info?.zhp) {
+        throw new Error('fetchShopInfo failed: shop_info.zhp not found.');
+      }
+      const zhpGoods = shopInfoResponse.shop_info.zhp.goods ?? [];
+      console.log('fetchShopInfo.shop_info.zhp.goods:', JSON.stringify(zhpGoods));
+
+      const greenGoodsIds = zhpGoods.slice(0, 4).map(Number).filter(id => Number.isInteger(id) && id > 0);
+      const maxTotalBuyable = Math.floor(latestGold / GREEN_GIFT_PRICE_GOLD);
+      let remainingPurchaseCount = Math.min(
+        maxTotalBuyable,
+        greenGoodsIds.length * GREEN_GIFT_MAX_COUNT_PER_GOODS
+      );
+      let spentGold = 0;
+      const purchasePlan = [];
+
+      for (const goodsId of greenGoodsIds) {
+        if (remainingPurchaseCount <= 0) {
+          break;
+        }
+
+        const count = Math.min(GREEN_GIFT_MAX_COUNT_PER_GOODS, remainingPurchaseCount);
+        if (count <= 0) {
+          continue;
+        }
+
+        const buyWrapper = await channel.sendRequest(
+          '.lq.Lobby.buyFromZHP',
+          encode(proto.ReqBuyFromZHP, { goods_id: goodsId, count })
+        );
+        const buyResponse = decode(proto.ResCommon, buyWrapper.data);
+        const errorCode = Number(buyResponse?.error?.code ?? 0);
+        if (errorCode === BUY_FROM_ZHP_LIMIT_REACHED_CODE) {
+          console.log(
+            `buyFromZHP: skip all purchases for this run (goods_id=${goodsId}, count=${count}, purchase limit reached):`,
+            JSON.stringify(buyResponse)
+          );
+          break;
+        }
+        if (errorCode !== 0) {
+          throw new Error(`buyFromZHP failed for goods_id=${goodsId} count=${count}: ${JSON.stringify(buyResponse)}`);
+        }
+
+        purchasePlan.push({ goods_id: goodsId, count });
+        remainingPurchaseCount -= count;
+        spentGold += count * GREEN_GIFT_PRICE_GOLD;
+      }
+
+      console.log('buyFromZHP.purchasePlan:', JSON.stringify(purchasePlan));
+      console.log('buyFromZHP.spentGold:', spentGold);
+      console.log('buyFromZHP.remainingGoldEstimate:', Math.max(0, latestGold - spentGold));
+    }
   } finally {
     await channel.close();
   }
